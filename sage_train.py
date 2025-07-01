@@ -30,6 +30,7 @@ from sage_core import (
     agreeing_subset_fast,
     _project_single_grad,
     per_sample_grads_slow,
+    per_sample_grads_last_layer_only,
     cutmix_criterion,
     CutMixDataLoader
 )
@@ -42,6 +43,13 @@ try:
 except ImportError:
     BASELINES_AVAILABLE = False
     logger.warning("Baselines module not available. Only SAGE methods will work.")
+
+# Optional TensorBoard support
+try:
+    from torch.utils.tensorboard import SummaryWriter
+    TENSORBOARD_AVAILABLE = True
+except ImportError:
+    TENSORBOARD_AVAILABLE = False
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -63,7 +71,7 @@ def parse_args():
     parser.add_argument('--per_class', action='store_true', default=True,
                        help='Use per-class subset selection')
     parser.add_argument('--subset_fraction', type=float, default=0.05,
-                       help='Fraction of training data to select (e.g., 0.05 = 5%)')
+                       help='Fraction of training data to select (e.g., 0.05 = 5 percent)')
     parser.add_argument('--sketch_size', type=int, default=256,
                        help='Sketch size (ell) for frequent directions')
     parser.add_argument('--selection_method', type=str, default='sage',
@@ -103,6 +111,12 @@ def parse_args():
                        help='Warmup epochs before first selection')
     parser.add_argument('--first_selection_epoch', type=int, default=1,
                        help='Epoch for first subset selection')
+    parser.add_argument('--single_selection', action='store_true',
+                       help='Perform subset selection only once (no iterative refresh)')
+    parser.add_argument('--no_warmup', action='store_true',
+                       help='Skip warmup and start with subset selection immediately')
+    parser.add_argument('--no_selection', action='store_true',
+                       help='Train on full dataset without any subset selection')
     
     # Compression schedule
     parser.add_argument('--compression_schedule', type=str, default='cpu',
@@ -144,6 +158,20 @@ def parse_args():
                        help='CutMix alpha parameter (beta distribution)')
     parser.add_argument('--cutmix_prob', type=float, default=0.5,
                        help='Probability of applying CutMix per batch')
+    
+    # Optional TensorBoard logging
+    parser.add_argument('--tensorboard', action='store_true',
+                       help='Enable TensorBoard logging')
+    parser.add_argument('--tensorboard_dir', type=str, default='./runs',
+                       help='TensorBoard log directory')
+    
+    # Checkpointing and warm start
+    parser.add_argument('--resume', type=str, default=None,
+                       help='Path to checkpoint file to resume from')
+    parser.add_argument('--save_checkpoint_freq', type=int, default=50,
+                       help='Save checkpoint every N epochs (0 to disable)')
+    parser.add_argument('--checkpoint_dir', type=str, default='./checkpoints',
+                       help='Directory to save checkpoints')
     
     return parser.parse_args()
 
@@ -200,7 +228,7 @@ def build_sketch(model: nn.Module, loader: DataLoader, args, device: torch.devic
         model.eval()
         for x, y in loader:
             x, y = x.to(device), y.to(device)
-            grad_sample = per_sample_grads_slow(model, x[:1], y[:1])
+            grad_sample = per_sample_grads_last_layer_only(model, x[:1], y[:1])
             D = grad_sample.shape[1]
             break
         
@@ -212,20 +240,21 @@ def build_sketch(model: nn.Module, loader: DataLoader, args, device: torch.devic
     else:  # FD method
         fd = FDStreamer(args.sketch_size, batch_size=args.batch_size_fd, dtype=torch.float16)
         
-        for xb, yb in tqdm(loader, desc="Building FD sketch"):
+        for xb, yb in tqdm(loader, desc="🔨 Building FD sketch (optimized)"):
             if args.compression_schedule == 'gpu':
                 xb, yb = xb.to(device), yb.to(device)
-                rows = per_sample_grads_slow(model, xb, yb)
+                rows = per_sample_grads_last_layer_only(model, xb, yb)
             else:  # CPU compression
                 # Move data to device for gradient computation
                 xb, yb = xb.to(device), yb.to(device)
-                rows = per_sample_grads_slow(model, xb, yb)
+                rows = per_sample_grads_last_layer_only(model, xb, yb)
                 # Convert to CPU for FD streaming
                 if isinstance(rows, torch.Tensor):
                     rows = rows.cpu().numpy()
             
             fd.add(rows)
         
+        print("✅ Sketch building complete")
         return torch.from_numpy(fd.finalize())
 
 
@@ -412,8 +441,84 @@ def save_results(results: Dict[str, Any], args):
         json.dump(config, f, indent=2)
 
 
+def save_checkpoint(epoch: int, model: nn.Module, optimizer: torch.optim.Optimizer,
+                   scheduler, results: Dict[str, Any], subset_indices: List[int],
+                   proj_matrix: torch.Tensor, args, checkpoint_dir: str):
+    """Save training checkpoint"""
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    
+    checkpoint = {
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
+        'results': results,
+        'subset_indices': subset_indices,
+        'proj_matrix': proj_matrix,
+        'args': vars(args),
+        'rng_state': torch.get_rng_state(),
+        'cuda_rng_state': torch.cuda.get_rng_state() if torch.cuda.is_available() else None
+    }
+    
+    checkpoint_path = os.path.join(checkpoint_dir, f'checkpoint_epoch_{epoch}.pth')
+    torch.save(checkpoint, checkpoint_path)
+    
+    # Also save as latest checkpoint
+    latest_path = os.path.join(checkpoint_dir, 'checkpoint_latest.pth')
+    torch.save(checkpoint, latest_path)
+    
+    logger.info(f"Checkpoint saved: {checkpoint_path}")
+    return checkpoint_path
+
+
+def load_checkpoint(checkpoint_path: str, model: nn.Module, optimizer: torch.optim.Optimizer,
+                   scheduler, device: torch.device):
+    """Load training checkpoint"""
+    logger.info(f"Loading checkpoint: {checkpoint_path}")
+    
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    
+    # Load model state
+    model.load_state_dict(checkpoint['model_state_dict'])
+    
+    # Load optimizer state
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    
+    # Load scheduler state
+    if scheduler and checkpoint['scheduler_state_dict']:
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+    
+    # Restore RNG states for reproducibility
+    torch.set_rng_state(checkpoint['rng_state'])
+    if torch.cuda.is_available() and checkpoint['cuda_rng_state']:
+        torch.cuda.set_rng_state(checkpoint['cuda_rng_state'])
+    
+    logger.info(f"Checkpoint loaded from epoch {checkpoint['epoch']}")
+    
+    return (checkpoint['epoch'], checkpoint['results'], checkpoint['subset_indices'],
+            checkpoint['proj_matrix'], checkpoint['args'])
+
+
 def main():
     args = parse_args()
+    
+    # Validate argument combinations
+    if args.no_warmup and args.warmup_epochs > 0:
+        logger.warning("--no_warmup conflicts with --warmup_epochs > 0. Setting warmup_epochs to 0.")
+        args.warmup_epochs = 0
+    
+    if args.single_selection and args.refresh_epochs < args.epochs:
+        logger.info(f"Single selection mode: subset will not be refreshed every {args.refresh_epochs} epochs")
+    
+    if args.no_warmup and args.single_selection:
+        logger.info("No-warmup + single selection mode: subset selected at epoch 1, no refreshes")
+    elif args.no_warmup:
+        logger.info("No-warmup mode: subset selected at epoch 1, refreshed every N epochs")
+    elif args.single_selection:
+        logger.info("Single selection mode: subset selected once, no refreshes")
+    elif args.no_selection:
+        logger.info("No selection mode: training on full dataset")
+        args.subset_fraction = 1.0  # Override to use full dataset
     
     # Set seed and device
     set_seed(args.seed)
@@ -450,17 +555,14 @@ def main():
     # Mixed precision scaler
     scaler = torch.cuda.amp.GradScaler() if args.amp and device.type == 'cuda' else None
     
-    # Initial data loaders
-    full_loader = DataLoader(train_dataset, batch_size=args.batch_size, 
-                           shuffle=False, num_workers=args.num_workers, pin_memory=True)
-    test_loader = DataLoader(test_dataset, batch_size=args.batch_size,
-                           shuffle=False, num_workers=args.num_workers, pin_memory=True)
+    # Initialize checkpoint directory
+    if args.save_checkpoint_freq > 0 or args.resume:
+        os.makedirs(args.checkpoint_dir, exist_ok=True)
     
-    # Training setup
-    train_loader = full_loader
+    # Initialize training state
+    start_epoch = 1
+    subset_indices = []
     proj_matrix = None
-    
-    # Results tracking
     results = {
         'train_losses': [],
         'train_accs': [],
@@ -468,31 +570,100 @@ def main():
         'test_accs': [],
         'selection_times': [],
         'subset_sizes': [],
+        'epoch_times': [],
+        'learning_rates': [],
+        'selection_epochs': [],
+        'memory_usage': [],
         'config': vars(args)
     }
     
+    # Load checkpoint if resuming
+    if args.resume:
+        if not os.path.exists(args.resume):
+            raise FileNotFoundError(f"Checkpoint not found: {args.resume}")
+        
+        start_epoch, results, subset_indices, proj_matrix, loaded_args = load_checkpoint(
+            args.resume, model, optimizer, scheduler, device
+        )
+        start_epoch += 1  # Start from next epoch
+        
+        logger.info(f"Resuming training from epoch {start_epoch}")
+        
+        # Restore subset if it exists
+        if subset_indices:
+            subset_dataset = Subset(train_dataset, subset_indices)
+            base_loader = DataLoader(subset_dataset, batch_size=args.batch_size,
+                                   shuffle=True, num_workers=args.num_workers, pin_memory=True)
+            if args.cutmix:
+                train_loader = CutMixDataLoader(base_loader, args.cutmix_alpha, args.cutmix_prob)
+            else:
+                train_loader = base_loader
+            logger.info(f"Restored subset with {len(subset_indices)} samples")
+    
+    # Initialize TensorBoard writer if enabled
+    writer = None
+    if args.tensorboard and TENSORBOARD_AVAILABLE:
+        run_name = f"{args.dataset}_{args.selection_method}_{args.subset_fraction}_{int(time.time())}"
+        writer = SummaryWriter(os.path.join(args.tensorboard_dir, run_name))
+        logger.info(f"TensorBoard logging enabled: {args.tensorboard_dir}/{run_name}")
+    elif args.tensorboard and not TENSORBOARD_AVAILABLE:
+        logger.warning("TensorBoard requested but not available. Install with: pip install tensorboard")
+    
+    # Initial data loaders (if not resuming with subset)
+    if not subset_indices:
+        full_loader = DataLoader(train_dataset, batch_size=args.batch_size, 
+                               shuffle=False, num_workers=args.num_workers, pin_memory=True)
+        train_loader = full_loader
+    
+    test_loader = DataLoader(test_dataset, batch_size=args.batch_size,
+                           shuffle=False, num_workers=args.num_workers, pin_memory=True)
+    
     # Training loop
-    for epoch in range(1, args.epochs + 1):
+    start_time = time.time()
+    for epoch in range(start_epoch, args.epochs + 1):
         epoch_start = time.time()
         
         # Subset selection logic
         do_selection = False
-        if epoch == args.first_selection_epoch and args.warmup_epochs == 0:
+        
+        # Handle no_selection mode - never perform subset selection
+        if args.no_selection:
+            do_selection = False
+        
+        # Handle no_warmup mode - immediate selection at epoch 1
+        elif args.no_warmup and epoch == 1 and not subset_indices:
             do_selection = True
-            logger.info(f"Initial subset selection at epoch {epoch}")
-        elif epoch == args.warmup_epochs + 1 and args.warmup_epochs > 0:
-            do_selection = True
-            logger.info(f"Subset selection after warmup at epoch {epoch}")
-        elif (epoch > max(args.first_selection_epoch, args.warmup_epochs + 1) and 
-              (epoch - max(args.first_selection_epoch, args.warmup_epochs + 1)) % args.refresh_epochs == 0):
-            do_selection = True
-            logger.info(f"Subset refresh at epoch {epoch}")
+            logger.info(f"No-warmup subset selection at epoch {epoch}")
+        
+        # Handle single_selection mode - only select once
+        elif args.single_selection and not subset_indices:
+            if args.warmup_epochs == 0 and epoch == args.first_selection_epoch:
+                do_selection = True
+                logger.info(f"Single subset selection at epoch {epoch}")
+            elif args.warmup_epochs > 0 and epoch == args.warmup_epochs + 1:
+                do_selection = True
+                logger.info(f"Single subset selection after warmup at epoch {epoch}")
+        
+        # Handle iterative selection mode (default behavior)
+        elif not args.single_selection and not args.no_warmup:
+            if epoch == args.first_selection_epoch and args.warmup_epochs == 0 and not subset_indices:
+                do_selection = True
+                logger.info(f"Initial subset selection at epoch {epoch}")
+            elif epoch == args.warmup_epochs + 1 and args.warmup_epochs > 0 and not subset_indices:
+                do_selection = True
+                logger.info(f"Subset selection after warmup at epoch {epoch}")
+            elif (subset_indices and epoch > max(args.first_selection_epoch, args.warmup_epochs + 1) and 
+                  (epoch - max(args.first_selection_epoch, args.warmup_epochs + 1)) % args.refresh_epochs == 0):
+                do_selection = True
+                logger.info(f"Subset refresh at epoch {epoch}")
         
         if do_selection:
             selection_start = time.time()
             
             # Build sketch/projection matrix
             logger.info("Building projection matrix...")
+            full_loader = DataLoader(train_dataset, batch_size=args.batch_size, 
+                                   shuffle=False, num_workers=args.num_workers, pin_memory=True)
             proj_matrix = build_sketch(model_for_grad, full_loader, args, device)
             
             # Select subset
@@ -526,33 +697,79 @@ def main():
         if scheduler is not None:
             scheduler.step()
         
+        epoch_time = time.time() - epoch_start
+        
         # Record results
         results['train_losses'].append(train_loss)
         results['train_accs'].append(train_acc)
         results['test_losses'].append(test_loss)
         results['test_accs'].append(test_acc)
+        results['epoch_times'].append(epoch_time)
+        results['learning_rates'].append(optimizer.param_groups[0]['lr'])
         
-        epoch_time = time.time() - epoch_start
+        # Record memory usage if CUDA available
+        if torch.cuda.is_available():
+            results['memory_usage'].append(torch.cuda.max_memory_allocated() / 1024**3)  # GB
+        
+        # Record if subset selection happened this epoch
+        if do_selection:
+            results['selection_epochs'].append(epoch)
         
         # Logging
         if epoch % args.log_interval == 0:
             lr = optimizer.param_groups[0]['lr']
             logger.info(f"Epoch {epoch:3d}/{args.epochs} | "
                        f"lr {lr:.5f} | "
-                       f"train {train_acc*100:5.2f}% | "
-                       f"test {test_acc*100:5.2f}% | "
+                       f"train_loss {train_loss:.4f} | train_acc {train_acc*100:.2f}% | "
+                       f"test_loss {test_loss:.4f} | test_acc {test_acc*100:.2f}% | "
                        f"time {epoch_time:.2f}s")
+        
+        # TensorBoard logging
+        if writer is not None:
+            writer.add_scalar('Loss/Train', train_loss, epoch)
+            writer.add_scalar('Loss/Test', test_loss, epoch)
+            writer.add_scalar('Accuracy/Train', train_acc, epoch)
+            writer.add_scalar('Accuracy/Test', test_acc, epoch)
+            writer.add_scalar('Learning_Rate', optimizer.param_groups[0]['lr'], epoch)
+            writer.add_scalar('Time/Epoch', epoch_time, epoch)
+            
+            if do_selection and 'selection_time' in locals():
+                writer.add_scalar('SAGE/Selection_Time', selection_time, epoch)
+                writer.add_scalar('SAGE/Subset_Size', len(subset_indices), epoch)
+            
+            if torch.cuda.is_available():
+                writer.add_scalar('Memory/GPU_Usage_GB', torch.cuda.max_memory_allocated() / 1024**3, epoch)
+        
+        # Save checkpoint
+        if args.save_checkpoint_freq > 0 and epoch % args.save_checkpoint_freq == 0:
+            save_checkpoint(epoch, model, optimizer, scheduler, results, subset_indices,
+                          proj_matrix, args, args.checkpoint_dir)
+        
+        # Save model if requested
+        if args.save_model and epoch == args.epochs:
+            model_path = os.path.join(args.output_dir, 'final_model.pth')
+            torch.save(model.state_dict(), model_path)
+            logger.info(f"Final model saved: {model_path}")
     
     # Save results
     save_results(results, args)
     
-    # Save model if requested
-    if args.save_model:
-        torch.save(model.state_dict(), os.path.join(args.output_dir, 'model.pth'))
+    # Close TensorBoard writer
+    if writer is not None:
+        writer.close()
     
-    logger.info(f"Training completed. Final test accuracy: {results['test_accs'][-1]*100:.2f}%")
-    logger.info(f"Results saved to {args.output_dir}")
+    # Final summary
+    total_time = time.time() - start_time
+    logger.info(f"Training completed in {total_time:.2f}s")
+    logger.info(f"Final test accuracy: {results['test_accs'][-1]*100:.2f}%")
+    logger.info(f"Best test accuracy: {max(results['test_accs'])*100:.2f}%")
+    logger.info(f"Results saved to: {args.output_dir}")
+    
+    if args.tensorboard and writer is not None:
+        logger.info(f"TensorBoard logs: {args.tensorboard_dir}")
+        logger.info("View with: tensorboard --logdir " + args.tensorboard_dir)
 
 
 if __name__ == '__main__':
     main()
+

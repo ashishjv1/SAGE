@@ -97,3 +97,11 @@ baselines.py
 *.zip
 *.tar.gz
 *.7z
+
+# Local testing (DO NOT UPLOAD TO GITHUB)
+quick_test.py
+quick_test/
+
+# TensorBoard logs
+runs/
+tensorboard/

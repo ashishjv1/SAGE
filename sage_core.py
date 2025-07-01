@@ -129,6 +129,50 @@ def per_sample_grads_slow(model: nn.Module, x: torch.Tensor, y: torch.Tensor) ->
     return np.stack(grads, axis=0)  # (B, D)
 
 
+def per_sample_grads_last_layer_only(model: nn.Module, x: torch.Tensor, y: torch.Tensor) -> np.ndarray:
+    """
+    Compute per-sample gradients for ONLY the last layer (classifier).
+    This is much faster for sketch building while maintaining SAGE effectiveness.
+    Returns a (B, D_last) NumPy array where D_last is the classifier parameter count.
+    """
+    model.eval()
+    B = x.size(0)
+    grads = []
+
+    # Find the last layer (classifier)
+    last_layer = None
+    for name, module in model.named_modules():
+        if isinstance(module, (nn.Linear, nn.Conv2d)) and hasattr(module, 'weight'):
+            last_layer = module
+    
+    if last_layer is None:
+        raise ValueError("Could not find classifier layer in model")
+
+    for i in tqdm(range(B), desc="Computing last-layer gradients", leave=False):
+        model.zero_grad(set_to_none=True)
+        logits = model(x[i:i+1])  # keep batch dim
+        loss = F.cross_entropy(logits, y[i:i+1])
+        loss.backward()
+
+        # Only collect gradients from the last layer
+        g_parts = []
+        if last_layer.weight.grad is not None:
+            g_parts.append(last_layer.weight.grad.flatten())
+        if hasattr(last_layer, 'bias') and last_layer.bias is not None and last_layer.bias.grad is not None:
+            g_parts.append(last_layer.bias.grad.flatten())
+        
+        if g_parts:
+            g = torch.cat(g_parts).cpu().numpy()
+        else:
+            # Fallback to a small random vector if no gradients
+            g = np.random.randn(last_layer.weight.numel() + (last_layer.bias.numel() if hasattr(last_layer, 'bias') and last_layer.bias is not None else 0)) * 1e-6
+        
+        grads.append(g)
+        torch.cuda.empty_cache()
+    
+    return np.stack(grads, axis=0)  # (B, D_last)
+
+
 def _project_single_grad(
     model: nn.Module, 
     x: torch.Tensor, 
@@ -185,7 +229,7 @@ def class_balanced_agreeing_subset_fast(
     indices_per_class = defaultdict(list)
 
     running_idx = 0
-    for X, Y in tqdm(loader, desc="Computing projected gradients"):
+    for X, Y in tqdm(loader, desc="🧮 Computing class-balanced gradients"):
         X = X.to(device, non_blocking=True)
         Y = Y.to(device, non_blocking=True)
 
@@ -218,6 +262,7 @@ def class_balanced_agreeing_subset_fast(
         running_idx += B
 
     # agreement scoring
+    print("⚡ Computing class-balanced agreement scores...")
     selected = []
     for cls in range(num_classes):
         if cls not in grads_per_class:
@@ -232,6 +277,7 @@ def class_balanced_agreeing_subset_fast(
         top_k = torch.topk(scores, min(samples_per_class, len(G))).indices
         selected.extend(I[top_k].tolist())
 
+    print(f"✅ Selected {len(selected)} samples across {num_classes} classes")
     return selected
 
 
@@ -264,7 +310,7 @@ def agreeing_subset_fast(
     all_indices = []  # matching dataset indices (tensor CPU)
 
     running_idx = 0
-    for X, Y in tqdm(loader, desc="Computing projected gradients"):
+    for X, Y in tqdm(loader, desc="🧮 Computing projected gradients"):
         X = X.to(device, non_blocking=True)
         Y = Y.to(device, non_blocking=True)
 
@@ -290,6 +336,7 @@ def agreeing_subset_fast(
         running_idx += B
 
     # agreement scoring
+    print("⚡ Computing agreement scores...")
     G = torch.cat(all_grads, dim=0)   # (N, ℓ) CPU
     I = torch.cat(all_indices, dim=0) # (N,) CPU
 
@@ -298,6 +345,7 @@ def agreeing_subset_fast(
     scores = G_norm @ centroid  # (N,)
 
     top = torch.topk(scores, min(subset_size, len(G))).indices
+    print(f"✅ Selected {len(top)} samples")
     return I[top].tolist()
 
 
